@@ -191,7 +191,7 @@ bool TryMergePatternLength(const StringSpec& spec, std::string* element_regex, i
 
 std::string BuildStringPatternEBNF(const StringSpec& spec) {
   // Try to merge length constraints into an anchored single-element pattern's repetition
-  // range (route C). Other shapes fall through to the plain pattern EBNF (length not enforced).
+  // range. Other shapes fall through to the plain pattern EBNF (length not enforced).
   if (spec.min_length != 0 || spec.max_length != -1) {
     std::string element_regex;
     int lo, hi;
@@ -206,6 +206,73 @@ std::string BuildStringPatternEBNF(const StringSpec& spec) {
     }
   }
   return RegexToEBNF(*spec.pattern, false);
+}
+
+// For a pattern combined with length constraints that the single-element repetition-merge fast
+// path cannot handle (any shape beyond an anchored single element), thread the
+// [minLength, maxLength] budget through the pattern structure and emit a right-linear grammar
+// (code-point layer) via `creator`. Returns the start-rule reference to be embedded (quoted) by
+// the caller, or std::nullopt to fall back to the plain pattern EBNF (over-accepting, i.e. no
+// worse than the status quo).
+static std::optional<std::string> TryGenerateLengthThreadedPattern(
+    const StringSpec& spec, EBNFScriptCreator& creator, int64_t& emit_budget
+) {
+  if (!spec.pattern.has_value()) return std::nullopt;
+  if (spec.min_length == 0 && spec.max_length == -1) return std::nullopt;  // no length constraint
+  if (spec.max_length == -1) return std::nullopt;  // unbounded upper bound: caller handles (plain)
+  // An anchored single-element shape is handled by the repetition-merge fast path with cleaner
+  // output; defer to it.
+  std::string element_regex;
+  int lo, hi;
+  if (TryMergePatternLength(spec, &element_regex, &lo, &hi)) return std::nullopt;
+
+  LengthThreadedGrammar g =
+      RegexToLengthThreadedGrammar(*spec.pattern, spec.min_length, spec.max_length);
+  if (g.empty || g.over_cap || g.states.empty()) return std::nullopt;  // fall back to plain
+
+  // Schema-wide emit budget: the kernel caps one pattern's size, but many pattern+length
+  // properties would otherwise sum without bound. Charge this pattern's emitted grammar bytes; if
+  // the schema's budget is exhausted, fall back to the plain over-accepting EBNF (== status quo).
+  // Each edge emits its char-class text plus a rule-name reference (`str_pattern_part_<i>` ≈ 24
+  // bytes with the " | " separator), so both the giant-class case (char-class dominates) and the
+  // many-small-edge case (names dominate) are accounted for. Checked before allocating names or
+  // emitting, so a rejected pattern leaves the creator untouched.
+  constexpr int64_t kEdgeNameOverhead = 24;
+  int64_t cost = 0;
+  for (const auto& st : g.states) {
+    for (const auto& [char_class, target] : st.edges) {
+      cost += static_cast<int64_t>(char_class.size()) + kEdgeNameOverhead;
+    }
+  }
+  if (cost > emit_budget) return std::nullopt;
+  emit_budget -= cost;
+
+  // Two-phase emit: allocate all rule names, then add bodies that reference them. Each state
+  // gets its own numbered hint: a shared hint would make AllocateRuleName rescan its suffix
+  // counter from 0 every time (O(states^2)) and hit NAME_SUFFIX_MAXIMUM (a hard failure) at
+  // ~10000 states -- well under the kernel's own state cap, and cumulative across all patterns
+  // in the schema. Numbered hints keep allocation O(1) and effectively unlimited.
+  std::vector<std::string> names(g.states.size());
+  for (size_t i = 0; i < g.states.size(); ++i) {
+    names[i] =
+        creator.AllocateRuleName(i == 0 ? "str_pattern" : "str_pattern_part_" + std::to_string(i));
+  }
+  for (size_t i = 0; i < g.states.size(); ++i) {
+    const LengthThreadedState& st = g.states[i];
+    std::string body;
+    bool first = true;
+    for (const auto& [char_class, target] : st.edges) {
+      if (!first) body += " | ";
+      body += char_class + " " + names[target];
+      first = false;
+    }
+    if (st.accepting) {
+      if (!first) body += " | ";
+      body += "\"\"";
+    }
+    creator.AddRuleWithAllocatedName(names[i], body);
+  }
+  return names[0];
 }
 
 // ==================== Spec ToString implementations ====================
@@ -710,7 +777,13 @@ Result<StringSpec, SchemaError> SchemaParser::ParseString(const picojson::object
           SchemaErrorType::kInvalidSchema, "minLength must be an integer"
       );
     }
-    spec.min_length = static_cast<int>(schema.at("minLength").get<int64_t>());
+    // Clamp instead of truncating: a plain cast of a value >= 2^31 wraps to an arbitrary int
+    // (2^32 -> 0 would silently drop the constraint). String length is never negative, so
+    // clamping the lower side to 0 is exact; huge upper values saturate to INT_MAX - 1, which
+    // the length-threading size cap then routes to the plain-pattern fallback.
+    spec.min_length = static_cast<int>(std::clamp<int64_t>(
+        schema.at("minLength").get<int64_t>(), 0, std::numeric_limits<int>::max() - 1
+    ));
   }
   if (schema.count("maxLength")) {
     if (!schema.at("maxLength").is<int64_t>()) {
@@ -718,7 +791,14 @@ Result<StringSpec, SchemaError> SchemaParser::ParseString(const picojson::object
           SchemaErrorType::kInvalidSchema, "maxLength must be an integer"
       );
     }
-    spec.max_length = static_cast<int>(schema.at("maxLength").get<int64_t>());
+    // Same saturation for the upper side. The lower side keeps in-range negatives as-is (they
+    // fall into the minLength > maxLength rejection below, and -1 keeps its historical
+    // "unset" meaning); INT_MIN is not -1, so hugely negative values are still rejected.
+    spec.max_length = static_cast<int>(std::clamp<int64_t>(
+        schema.at("maxLength").get<int64_t>(),
+        std::numeric_limits<int>::min(),
+        std::numeric_limits<int>::max() - 1
+    ));
   }
   if (spec.max_length != -1 && spec.min_length > spec.max_length) {
     return ResultErr<SchemaError>(
@@ -731,15 +811,35 @@ Result<StringSpec, SchemaError> SchemaParser::ParseString(const picojson::object
   // constraints, the effective repetition range is the intersection of the element's own
   // range with [minLength, maxLength]. If that intersection is empty (lo > hi), no string
   // can satisfy the schema; reject it here, consistent with the minLength > maxLength case.
-  // (Alternation and other complex shapes are not detectable here; see route C limitation.)
+  // (Alternation and other complex shapes are not detectable by the single-element merge; the
+  // length-threading construction below handles them.)
   if (spec.pattern.has_value() && (spec.min_length != 0 || spec.max_length != -1)) {
     std::string unused;  // the element regex is only needed for generation, not here
     int lo, hi;
-    if (TryMergePatternLength(spec, &unused, &lo, &hi) && hi != -1 && lo > hi) {
-      return ResultErr<SchemaError>(
-          SchemaErrorType::kUnsatisfiableSchema,
-          "pattern \"" + *spec.pattern + "\" combined with the length constraints accepts no string"
-      );
+    if (TryMergePatternLength(spec, &unused, &lo, &hi)) {
+      if (hi != -1 && lo > hi) {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kUnsatisfiableSchema,
+            "pattern \"" + *spec.pattern +
+                "\" combined with the length constraints accepts no string"
+        );
+      }
+    } else if (spec.max_length != -1) {
+      // Structured pattern (the single-element merge cannot decide) with a finite max length:
+      // detect a generally empty intersection via the length-threading construction. over_cap
+      // leaves g.empty false, so we conservatively do not reject when the size cap is hit. The
+      // construction runs again at generation time (TryGenerateLengthThreadedPattern); the
+      // duplication is deliberate: within the size cap it is ~1ms, and calling with identical
+      // arguments guarantees the unsat decision here matches what generation would build.
+      LengthThreadedGrammar g =
+          RegexToLengthThreadedGrammar(*spec.pattern, spec.min_length, spec.max_length);
+      if (g.empty) {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kUnsatisfiableSchema,
+            "pattern \"" + *spec.pattern +
+                "\" combined with the length constraints accepts no string"
+        );
+      }
     }
   }
   return ResultOk(std::move(spec));
@@ -1701,8 +1801,14 @@ std::string JSONSchemaConverter::GenerateString(
 
   // Check for pattern
   if (spec.pattern.has_value()) {
+    // Thread length constraints through structured patterns that the single-element repetition
+    // merge can't handle (alternation / multi-element / nested repetition). Emits helper rules
+    // and returns a reference to the start rule.
+    if (auto ref = TryGenerateLengthThreadedPattern(spec, ebnf_script_creator_, lt_emit_budget_)) {
+      return "\"\\\"\" " + *ref + " \"\\\"\"";
+    }
     // BuildStringPatternEBNF merges any length constraints into an anchored single-element
-    // pattern's repetition range (route C), or falls back to the plain pattern EBNF.
+    // pattern's repetition range, or falls back to the plain pattern EBNF.
     return "\"\\\"\" " + BuildStringPatternEBNF(spec) + " \"\\\"\"";
   }
 

@@ -418,6 +418,15 @@ class JSONSchemaConverter {
   // behavior.
   bool any_order_ = false;
 
+  // Schema-wide budget (in emitted char-class bytes) for length-threaded pattern grammars. The
+  // per-pattern kernel cap bounds one pattern's output, but a schema with many pattern+length
+  // properties emits that much per property and the total is otherwise unbounded (a linear-size
+  // schema can force hundreds of MB of grammar text). Each length-threaded pattern subtracts its
+  // emitted size; once exhausted, remaining patterns fall back to the plain (over-accepting) EBNF,
+  // no worse than the status quo. 16 MiB is many times the largest realistic schema's threaded
+  // output yet bounds the pathological many-property case. See TryGenerateLengthThreadedPattern.
+  int64_t lt_emit_budget_ = 16 * 1024 * 1024;
+
  public:
   // Basic rule names
   static const std::string kBasicAny;

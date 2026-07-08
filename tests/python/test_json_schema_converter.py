@@ -1,3 +1,4 @@
+import itertools
 import json
 import re
 import sys
@@ -2189,18 +2190,335 @@ def test_string_pattern_with_length():
     check_schema_with_instance(schema4, '"abcde"', is_accepted=False, any_whitespace=False)
 
 
-@pytest.mark.xfail(
-    reason="route C does not enforce length for alternation patterns; "
-    "general fix is route A follow-up",
-    strict=False,
-)
 def test_string_pattern_alternation_with_length():
-    # Alternation shapes are not recognized by route C, so length is not enforced (falls back to
-    # pattern-only). Route A (FSM intersection) is the general fix and is out of scope here.
+    # Structured patterns (alternation, multi-element, groups, {n,m}) combined with length
+    # constraints are handled by the length-threading construction (json_schema_converter.cc /
+    # regex_converter.cc RegexToLengthThreadedGrammar), which the single-element repetition merge
+    # could not do.
     schema = {"type": "string", "pattern": "^(a|bb|ccc)$", "maxLength": 2}
     check_schema_with_instance(schema, '"a"', is_accepted=True, any_whitespace=False)
     check_schema_with_instance(schema, '"bb"', is_accepted=True, any_whitespace=False)
     check_schema_with_instance(schema, '"ccc"', is_accepted=False, any_whitespace=False)
+
+
+def test_string_pattern_length_structured():
+    # Multi-element concatenation: length is counted across the whole string.
+    schema = {"type": "string", "pattern": "^[a-z]+[0-9]+$", "maxLength": 3, "minLength": 1}
+    check_schema_with_instance(schema, '"a0"', is_accepted=True, any_whitespace=False)
+    check_schema_with_instance(schema, '"ab0"', is_accepted=True, any_whitespace=False)
+    check_schema_with_instance(schema, '"a00"', is_accepted=True, any_whitespace=False)
+    check_schema_with_instance(schema, '"abc0"', is_accepted=False, any_whitespace=False)  # len 4
+    check_schema_with_instance(schema, '"ab"', is_accepted=False, any_whitespace=False)  # no digit
+
+    # Alternation that fits vs. gets filtered by the bound.
+    schema = {"type": "string", "pattern": "^(cat|dog)$", "maxLength": 3}
+    check_schema_with_instance(schema, '"cat"', is_accepted=True, any_whitespace=False)
+    check_schema_with_instance(schema, '"dog"', is_accepted=True, any_whitespace=False)
+    check_schema_with_instance(schema, '"cats"', is_accepted=False, any_whitespace=False)
+
+    # Group + repetition.
+    schema = {"type": "string", "pattern": "^(ab)*$", "maxLength": 4}
+    check_schema_with_instance(schema, '""', is_accepted=True, any_whitespace=False)
+    check_schema_with_instance(schema, '"abab"', is_accepted=True, any_whitespace=False)
+    check_schema_with_instance(schema, '"ababab"', is_accepted=False, any_whitespace=False)  # len 6
+
+
+def test_string_pattern_length_unsatisfiable():
+    # A structured pattern whose shortest match exceeds maxLength accepts no string; the schema is
+    # rejected as unsatisfiable (empty-intersection detection), matching the single-element
+    # lo > hi behavior.
+    with pytest.raises(RuntimeError, match="accepts no string"):
+        xgr.Grammar.from_json_schema({"type": "string", "pattern": "^(cat|dog)$", "maxLength": 2})
+    with pytest.raises(RuntimeError, match="accepts no string"):
+        xgr.Grammar.from_json_schema({"type": "string", "pattern": "^[a-z]{5,10}$", "maxLength": 3})
+
+
+def test_string_pattern_length_escapes():
+    # Escapes in a structured pattern (so it goes through length threading, not the single-element
+    # merge) must decode via the shared ParseNextEscaped exactly like the plain regex converter:
+    # \uHHHH / \xHH become the code point, not a literal run of characters.
+    bs = chr(92)  # build the backslash at runtime so nothing can mangle the \u / \x sequences
+    for pattern in (bs + "u0041[0-9]+", bs + "x41[0-9]+"):  # A == \x41 == 'A'
+        schema = {"type": "string", "pattern": pattern, "minLength": 2, "maxLength": 2}
+        check_schema_with_instance(schema, '"A5"', is_accepted=True, any_whitespace=False)
+        check_schema_with_instance(
+            schema, '"A55"', is_accepted=False, any_whitespace=False
+        )  # len 3
+        # The former mis-parse treated A as the literal characters u,0,0,4,1.
+        check_schema_with_instance(schema, '"u5"', is_accepted=False, any_whitespace=False)
+
+    # An escaped metacharacter is a literal.
+    schema = {"type": "string", "pattern": r"\.[0-9]", "minLength": 2, "maxLength": 2}
+    check_schema_with_instance(schema, '".5"', is_accepted=True, any_whitespace=False)
+    check_schema_with_instance(schema, '"a5"', is_accepted=False, any_whitespace=False)
+
+    # \s matches U+00A0, matching the plain converter's definition.
+    schema = {"type": "string", "pattern": r"\s[0-9]", "minLength": 2, "maxLength": 2}
+    check_schema_with_instance(schema, '" 5"', is_accepted=True, any_whitespace=False)
+    check_schema_with_instance(schema, '" 5"', is_accepted=True, any_whitespace=False)
+    check_schema_with_instance(schema, '"x5"', is_accepted=False, any_whitespace=False)
+
+
+@pytest.mark.parametrize(
+    ("pattern", "min_length", "max_length", "alphabet", "upto"),
+    [
+        ("^(cat|dog)$", None, 3, "catdog", 4),  # alternation exactly at the bound
+        ("^(a|bb|ccc)$", None, 2, "abc", 4),  # mixed-length alternation filtered
+        ("^[a-z]+[0-9]+$", 1, 3, "a0b1", 5),  # multi-element concatenation
+        ("^[a-z]+$", 2, 3, "abc", 5),  # single element (repetition-merge fast path, as control)
+        ("^(ab)*$", None, 4, "ab", 5),  # group + star
+        ("^(x|yy)+$", 1, 4, "xy", 5),  # variable-length unit repetition
+        ("^[a-z]{2,4}$", None, 3, "ab", 5),  # {n,m} narrowed by maxLength
+        ("^[a你😀]+$", 1, 2, "a你😀", 3),  # length counts code points, not bytes
+        (r"^\d{1,3}[a-z]$", None, 3, "1a", 4),  # escape class with quantifier
+        ("^a?b?c?$", 1, 2, "abc", 4),  # optional chain
+        ("^((a|b)c)+$", None, 4, "abc", 5),  # nested group repetition
+    ],
+)
+def test_string_pattern_length_matches_re_oracle(pattern, min_length, max_length, alphabet, upto):
+    # Exhaustive differential test: the grammar for pattern ∩ [minLength, maxLength] must accept
+    # exactly the strings the Python `re` reference implementation accepts (fullmatch of the
+    # unanchored body) whose code-point length is in range. Enumerates every string over the
+    # small alphabet up to length `upto`, so any semantic drift between the length-threading
+    # construction and real regex semantics shows up as a concrete counterexample.
+    schema = {"type": "string", "pattern": pattern}
+    if min_length is not None:
+        schema["minLength"] = min_length
+    if max_length is not None:
+        schema["maxLength"] = max_length
+    grammar = xgr.Grammar.from_json_schema(json.dumps(schema))
+    body = pattern.lstrip("^").rstrip("$")
+    for length in range(upto + 1):
+        for chars in itertools.product(alphabet, repeat=length):
+            s = "".join(chars)
+            in_range = (min_length is None or len(s) >= min_length) and (
+                max_length is None or len(s) <= max_length
+            )
+            expected = in_range and re.fullmatch(body, s, re.DOTALL) is not None
+            accepted = _is_grammar_accept_string(grammar, json.dumps(s, ensure_ascii=False))
+            assert accepted == expected, (
+                f"pattern={pattern!r} min={min_length} max={max_length} string={s!r}: "
+                f"grammar={accepted}, re-oracle={expected}"
+            )
+
+
+def test_string_pattern_length_invalid_regex_consistent():
+    # Invalid regex constructs must behave identically whether or not length constraints route
+    # the pattern through the length-threading construction (it falls back instead of silently
+    # building a wrong grammar: [^z-a] must not become "any character", a{3,2} must not
+    # become a{3}, a** must not accept the literal string "a*").
+    rejected = (
+        "^[z-a][0-9]$",
+        "^[^z-a][0-9]$",
+        "^a{3,2}b$",
+        # Consecutive / dangling quantifiers and malformed {n,m} shapes.
+        "^a**$",
+        "^a*+$",
+        "^(a|b)++$",
+        "^a???$",
+        "^a{2}{3}$",
+        "^a{x}$",
+        "^a{,5}$",
+    )
+    for pattern in rejected:
+        with pytest.raises(RuntimeError):
+            xgr.Grammar.from_json_schema(json.dumps({"type": "string", "pattern": pattern}))
+        with pytest.raises(RuntimeError):
+            xgr.Grammar.from_json_schema(
+                json.dumps({"type": "string", "pattern": pattern, "minLength": 1, "maxLength": 9})
+            )
+    # A leading quantifier is not rejected by the plain converter (pre-existing); the two paths
+    # must at least stay consistent: with length constraints it compiles the same way.
+    for pattern in ("^*a$",):
+        xgr.Grammar.from_json_schema(json.dumps({"type": "string", "pattern": pattern}))
+        xgr.Grammar.from_json_schema(
+            json.dumps({"type": "string", "pattern": pattern, "minLength": 1, "maxLength": 9})
+        )
+    # A quantifier applied to a bare anchor (`a^*b`) is accepted by the plain converter (which
+    # drops the anchor). Length threading must not quantify the anchor's epsilon into a different
+    # language; it falls back to the plain path, so the two produce the identical grammar.
+    for pattern in ("a^*b", "a$+b", "a^{2}b"):
+        baseline = xgr.Grammar.from_json_schema(json.dumps({"type": "string", "pattern": pattern}))
+        threaded = xgr.Grammar.from_json_schema(
+            json.dumps({"type": "string", "pattern": pattern, "maxLength": 4})
+        )
+        assert str(baseline) == str(threaded)
+
+
+def test_string_pattern_length_deep_nesting_no_crash():
+    # Adversarial nesting depth: the length-threading parser recurses per group, so it must
+    # bail out (falling back to the plain path's clean rejection) instead of overflowing the
+    # stack and crashing the process.
+    n = 100000
+    pattern = "(" * n + "a" + ")" * n
+    schema = {"type": "string", "pattern": pattern, "minLength": 1, "maxLength": 2}
+    with pytest.raises(RuntimeError):
+        xgr.Grammar.from_json_schema(json.dumps(schema))
+
+
+def test_string_pattern_length_large_max_length_compiles():
+    # A large-but-satisfiable maxLength on a structured pattern must never hard-fail: the rule
+    # namer used to exhaust its suffix counter (FATAL) at ~10000 states, and allocation was
+    # quadratic. Now it either builds the threaded grammar or falls back to the plain pattern.
+    schema = {"type": "string", "pattern": "^[a-z]+[0-9]+$", "maxLength": 6000}
+    grammar = xgr.Grammar.from_json_schema(json.dumps(schema))
+    assert _is_grammar_accept_string(grammar, '"ab01"')
+
+    # The rule-name table is shared across the whole schema, so multiple length-threaded
+    # properties must not collide either.
+    schema = {
+        "type": "object",
+        "properties": {
+            "a": {"type": "string", "pattern": "^[a-z]+[0-9]+$", "maxLength": 3000},
+            "b": {"type": "string", "pattern": "^[a-z]+[0-9]+$", "maxLength": 3000},
+        },
+        "required": ["a", "b"],
+    }
+    grammar = xgr.Grammar.from_json_schema(json.dumps(schema))
+    assert _is_grammar_accept_string(grammar, '{"a": "x1", "b": "y2"}')
+
+
+def test_string_pattern_length_wide_alternation_falls_back():
+    # The state cap bounds positions * length but not the follow sets / product edges, which are
+    # quadratic in the alternation width. Wide alternations must trip the edge budget and fall
+    # back to the plain pattern (over-accepting) instead of exploding in time/memory.
+    # Follow-set explosion shape: (a|a|...)* with a tiny length bound.
+    pattern = "^(" + "|".join(["a"] * 4000) + ")*$"
+    schema = {"type": "string", "pattern": pattern, "maxLength": 0}
+    xgr.Grammar.from_json_schema(json.dumps(schema))
+
+    # Product-edge explosion shape: (c1|...|cm)(c1|...|cm) with maxLength 2.
+    alts = "|".join(chr(0x4E00 + i) for i in range(800))
+    schema = {"type": "string", "pattern": f"^({alts})({alts})$", "maxLength": 2}
+    grammar = xgr.Grammar.from_json_schema(json.dumps(schema))
+    two_chars = chr(0x4E00) + chr(0x4E00 + 799)
+    assert _is_grammar_accept_string(grammar, json.dumps(two_chars, ensure_ascii=False))
+
+
+def test_string_pattern_length_giant_char_class_falls_back():
+    # The edge budget must weight each edge by its char-class size, not just count edges: a single
+    # class with thousands of ranges is one node / one follow entry yet copies its whole text onto
+    # every edge (x maxLength). Counting edges alone let ~11 KB of schema emit tens of MB of
+    # grammar text and multi-GB RSS. It must now trip the budget and fall back to the plain
+    # (over-accepting) pattern instead.
+    giant = "".join(chr(0x3000 + 2 * i) for i in range(2000))  # 2000 non-adjacent code points
+    schema = {"type": "string", "pattern": f"[{giant}]*d", "maxLength": 1500}
+    grammar = xgr.Grammar.from_json_schema(json.dumps(schema))
+    # Falls back to plain: no length-threaded helper rules were emitted.
+    assert "str_pattern_part" not in str(grammar)
+    assert _is_grammar_accept_string(grammar, '"d"')
+    assert _is_grammar_accept_string(grammar, '"　d"')
+
+
+def test_string_pattern_length_many_properties_bounded():
+    # The per-pattern kernel cap bounds one pattern's output, but a schema with many pattern+length
+    # properties emits that much per property; the schema-wide emit budget caps the total, so later
+    # properties fall back to the plain pattern instead of the threaded output growing without
+    # bound. A single "^(a|bc)+$" x maxLength 1000 threads to ~0.24 MB, so 200 fully-threaded
+    # properties would be ~48 MB; the budget must hold the total far below that.
+    props = {
+        f"p{i}": {"type": "string", "pattern": "^(a|bc)+$", "maxLength": 1000} for i in range(200)
+    }
+    grammar = xgr.Grammar.from_json_schema(json.dumps({"type": "object", "properties": props}))
+    text = str(grammar)
+    assert "str_pattern" in text  # at least the early properties were threaded
+    # The budget caps threaded output; only the cheap plain fallbacks grow with property count, so
+    # the total stays well under the ~48 MB all-threaded projection.
+    assert len(text) < 35 * 1024 * 1024
+
+
+def test_string_pattern_length_extreme_max_length():
+    # maxLength values at or beyond INT_MAX used to be truncated by a plain int cast: 2^32 -> 0
+    # made the unsat detection reject a satisfiable schema, 2^31 went negative. They now saturate
+    # and route through the plain-pattern fallback.
+    for max_length in (2**31 - 1, 2**31, 2**32):
+        schema = {"type": "string", "pattern": "^[a-z]+[0-9]+$", "maxLength": max_length}
+        grammar = xgr.Grammar.from_json_schema(json.dumps(schema))
+        assert _is_grammar_accept_string(grammar, '"ab01"')
+
+
+def test_string_pattern_length_defers_match_baseline():
+    # Shapes the length threading explicitly defers must keep compiling exactly like the
+    # baseline (plain pattern, length not threaded): format alongside length constraints, and
+    # an unbounded upper length.
+    schema = {"type": "string", "format": "email", "minLength": 1, "maxLength": 40}
+    xgr.Grammar.from_json_schema(json.dumps(schema))
+
+    schema = {"type": "string", "pattern": "^[a-z]+[0-9]+$", "minLength": 2}
+    grammar = xgr.Grammar.from_json_schema(json.dumps(schema))
+    assert _is_grammar_accept_string(grammar, '"ab01"')
+
+
+@pytest.mark.parametrize(
+    ("pattern", "min_length", "max_length"),
+    [("^(a|bb)+$", 1, 4), ("^(ab)*$", 0, 4), ("^[ab]+a$", 2, 3)],
+)
+def test_string_pattern_length_mask_trajectory(pattern, min_length, max_length):
+    # Coaccessibility pruning does not change the accepted language, so the exhaustive
+    # fullmatch oracle cannot detect a pruning regression -- it would only show up during
+    # decoding as an empty (or wrong) token mask. This walks every string over the pattern's
+    # alphabet character by character and checks the token mask against prefix liveness
+    # computed from the `re` oracle at every step.
+    from xgrammar.testing import (
+        _get_masked_tokens_from_bitmask,
+        _get_matcher_from_grammar_and_tokenizer_info,
+    )
+
+    alphabet = "ab"
+    body = pattern.lstrip("^").rstrip("$")
+    schema = {
+        "type": "string",
+        "pattern": pattern,
+        "minLength": min_length,
+        "maxLength": max_length,
+    }
+    grammar = xgr.Grammar.from_json_schema(json.dumps(schema))
+
+    vocab = list(alphabet) + ['"']
+    tokenizer_info = xgr.TokenizerInfo(vocab)
+    matcher = _get_matcher_from_grammar_and_tokenizer_info(
+        grammar, tokenizer_info, terminate_without_stop_token=True
+    )
+    bitmask = xgr.allocate_token_bitmask(1, tokenizer_info.vocab_size)
+
+    def matches(s: str) -> bool:
+        return min_length <= len(s) <= max_length and re.fullmatch(body, s) is not None
+
+    def live(prefix: str) -> bool:
+        # Some completion within maxLength exists. The pattern's alphabet is `alphabet`, so
+        # enumerating completions over it is exhaustive.
+        return any(
+            matches(prefix + "".join(tail))
+            for extra in range(max_length - len(prefix) + 1)
+            for tail in itertools.product(alphabet, repeat=extra)
+        )
+
+    for length in range(max_length + 2):
+        for chars in itertools.product(alphabet, repeat=length):
+            prefix = "".join(chars)
+            if length > 0 and not live(prefix):
+                continue
+            matcher.reset()
+            assert matcher.accept_string('"')
+            ok = True
+            for i, ch in enumerate(prefix):
+                if not live(prefix[: i + 1]):
+                    ok = False
+                    break
+                assert matcher.accept_string(ch), f"pattern={pattern!r} prefix={prefix[: i + 1]!r}"
+            if not ok:
+                continue
+            matcher.fill_next_token_bitmask(bitmask)
+            rejected = set(_get_masked_tokens_from_bitmask(bitmask, tokenizer_info.vocab_size))
+            allowed = {vocab[i] for i in set(range(len(vocab))) - rejected}
+            expected = {c for c in alphabet if live(prefix + c)}
+            if matches(prefix):
+                expected.add('"')
+            assert allowed == expected, (
+                f"pattern={pattern!r} prefix={prefix!r}: mask allows {sorted(allowed)}, "
+                f"oracle expects {sorted(expected)}"
+            )
+            assert expected, f"pattern={pattern!r} prefix={prefix!r}: live prefix with empty mask"
 
 
 def test_type_array():
